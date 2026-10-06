@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""
+check_crest.py - summarize many CREST conformer searches at once.
+
+Looks for CREST job folders (any folder containing crest.out) and reports for each:
+  - whether CREST terminated normally
+  - the settings it actually ran with (method, --chrg, --uhf, --alpb), and whether --uhf matches
+    the multiplicity in the file name (..._m2... -> --uhf 1)
+  - the number of conformers and their relative energies (kcal/mol)
+  - for metal complexes: whether any conformer lost/gained metal-ligand bonds or changed isomer
+    (which atoms are trans to each other) compared with the input structure
+
+Usage (run in the folder that contains the CREST job folders):
+    python check_crest.py                       # table + crest_summary.csv
+    python check_crest.py dir1 dir2             # only these folders
+    python check_crest.py --split 3.0           # also write each conformer within 3.0 kcal/mol
+                                                #   of the best as its own .xyz (for g-xTB/DFT)
+Only numpy is required.
+"""
+import argparse, csv, glob, os, re, sys
+import numpy as np
+
+HARTREE2KCAL = 627.5095
+RCOV = dict(H=0.31, B=0.84, C=0.76, N=0.71, O=0.66, F=0.57, Si=1.11, P=1.07, S=1.05, Cl=1.02, Se=1.20,
+            Br=1.20, I=1.39, Sc=1.70, Ti=1.60, V=1.53, Cr=1.39, Mn=1.39, Fe=1.32, Co=1.26, Ni=1.24,
+            Cu=1.32, Zn=1.22, Y=1.90, Zr=1.75, Nb=1.64, Mo=1.54, Tc=1.47, Ru=1.46, Rh=1.42, Pd=1.39,
+            Ag=1.45, Cd=1.44, Hf=1.75, Ta=1.70, W=1.62, Re=1.51, Os=1.44, Ir=1.41, Pt=1.36, Au=1.36, Hg=1.32)
+METALS = {"Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Y", "Zr", "Nb", "Mo", "Tc", "Ru",
+          "Rh", "Pd", "Ag", "Cd", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg"}
+
+# ------------------------------------------------------------------ files
+
+def read_multi_xyz(path):
+    """All structures in a (multi-)xyz file -> list of (elements, coords, comment)."""
+    lines = open(path, errors="ignore").read().splitlines()
+    out, i = [], 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if not s:
+            i += 1; continue
+        try:
+            n = int(s.split()[0])
+        except ValueError:
+            i += 1; continue
+        block = lines[i + 2:i + 2 + n]
+        if len(block) < n:
+            break
+        rows = [b.split() for b in block]
+        el = [r[0].capitalize() for r in rows]
+        x = np.array([[float(v) for v in r[1:4]] for r in rows])
+        out.append((el, x, lines[i + 1]))
+        i += n + 2
+    return out
+
+def energy_from_comment(c):
+    m = re.search(r"-?\d+\.\d+", c)
+    return float(m.group()) if m else None
+
+def find_first(folder, patterns):
+    for p in patterns:
+        hits = sorted(glob.glob(os.path.join(folder, p)))
+        if hits:
+            return hits[0]
+    return None
+
+# ------------------------------------------------------------------ metal environment
+
+def metal_shell(el, x):
+    """(metal index, sorted neighbour elements, trans-pair signature) or None if no metal."""
+    m = next((i for i, e in enumerate(el) if e in METALS), None)
+    if m is None:
+        return None
+    d = np.linalg.norm(x - x[m], axis=1)
+    nb = [i for i in range(len(el)) if i != m and el[i] != "H"
+          and d[i] < 1.3 * (RCOV.get(el[m], 1.4) + RCOV.get(el[i], 1.5))]
+    def ang(i, j):
+        v1, v2 = x[i] - x[m], x[j] - x[m]
+        return np.degrees(np.arccos(np.clip(v1 @ v2 / np.linalg.norm(v1) / np.linalg.norm(v2), -1, 1)))
+    pairs, used = [], set()
+    for a, i, j in sorted(((ang(i, j), i, j) for k, i in enumerate(nb) for j in nb[k + 1:]), reverse=True):
+        if a < 140: break
+        if i in used or j in used: continue
+        used |= {i, j}; pairs.append("-".join(sorted([el[i], el[j]])))
+    return m, sorted(el[i] for i in nb), ", ".join(sorted(pairs))
+
+# ------------------------------------------------------------------ one CREST folder
+
+def analyze(folder):
+    r = {"folder": os.path.basename(os.path.normpath(folder)), "path": folder}
+    out = os.path.join(folder, "crest.out")
+    text = open(out, errors="ignore").read() if os.path.isfile(out) else ""
+    r["terminated"] = bool(re.search(r"CREST terminated normally", text))
+    # command line as echoed by CREST (first line that looks like 'crest <file> --...')
+    cmd = next((l.strip().lstrip(">$ ").strip() for l in text.splitlines()[:300]
+                if re.search(r"\bcrest\s+\S+\.(xyz|sdf|mol|pdb|coord)\b", l) or re.search(r"\bcrest\b.*--", l)), "")
+    r["command"] = cmd
+    flag = lambda pat: (re.search(pat, cmd).group(1) if re.search(pat, cmd) else None)
+    r["method"] = next((m for m in ("gfn2//gfnff", "gfnff", "gfn2", "gfn1", "gfn0", "gxtb") if f"--{m}" in cmd), "default")
+    r["chrg"] = flag(r"--chrg\s+(-?\d+)")
+    r["uhf"] = flag(r"--uhf\s+(\d+)")
+    r["alpb"] = flag(r"--alpb\s+(\S+)") or flag(r"--gbsa\s+(\S+)")
+    r["warnings"] = len(re.findall(r"warning", text, re.I))
+    nm = re.search(r"_m(\d+)(?:_|$)", r["folder"])
+    r["name_mult"] = int(nm.group(1)) if nm else None
+    r["uhf_ok"] = (r["name_mult"] is None or r["uhf"] is None and r["name_mult"] == 1
+                   or (r["uhf"] is not None and int(r["uhf"]) == r["name_mult"] - 1))
+
+    ens = find_first(folder, ["*_crest_conformers.xyz", "crest_conformers.xyz"])
+    best = find_first(folder, ["*_lec.xyz", "crest_best.xyz"])
+    inp = find_first(folder, [r["folder"] + ".xyz", "coord"])
+    r["ensemble"], r["best"] = ens, best
+    confs = read_multi_xyz(ens) if ens else []
+    r["_confs"] = confs
+    r["n_conf"] = len(confs)
+    E = [energy_from_comment(c[2]) for c in confs]
+    if confs and all(e is not None for e in E):
+        e0 = min(E)
+        rel = [(e - e0) * HARTREE2KCAL for e in E]
+        r["_rel"] = rel
+        r["E_best"] = e0
+        r["n_1kcal"] = sum(1 for v in rel if v <= 1.0)
+        r["n_3kcal"] = sum(1 for v in rel if v <= 3.0)
+        r["rel_energies"] = ", ".join(f"{v:.2f}" for v in rel[:8]) + (" ..." if len(rel) > 8 else "")
+    else:
+        r["_rel"] = [None] * len(confs)
+
+    # metal environment vs input structure
+    r["metal_check"] = ""
+    ref = None
+    if inp and os.path.basename(inp) != "coord":
+        s = read_multi_xyz(inp)
+        ref = metal_shell(*s[0][:2]) if s else None
+    if ref is None and confs:
+        ref = metal_shell(*confs[0][:2])
+    if ref is not None and confs:
+        changed_bonds = [k + 1 for k, c in enumerate(confs) if metal_shell(c[0], c[1])[1] != ref[1]]
+        changed_iso = [k + 1 for k, c in enumerate(confs)
+                       if k + 1 not in changed_bonds and metal_shell(c[0], c[1])[2] != ref[2]]
+        r["metal_CN"] = len(ref[1])
+        r["trans_ref"] = ref[2]
+        msgs = []
+        if changed_bonds: msgs.append(f"metal-ligand bonds differ in conformer(s) {changed_bonds[:10]}")
+        if changed_iso: msgs.append(f"isomer (trans pattern) differs in conformer(s) {changed_iso[:10]}")
+        r["metal_check"] = "; ".join(msgs)
+        r["_bad"] = set(changed_bonds) | set(changed_iso)
+    else:
+        r["_bad"] = set()
+
+    r["status"] = classify(r, text)
+    return r
+
+def classify(r, text):
+    if not text:
+        return "NO_OUTPUT"
+    if not r["terminated"]:
+        return "NOT_FINISHED"          # still running, killed (time/memory), or crashed
+    if not r["uhf_ok"]:
+        return "UHF_MISMATCH"
+    if r["n_conf"] == 0:
+        return "NO_ENSEMBLE"
+    if r["metal_check"]:
+        return "OK+CHECK_STRUCTURES"
+    return "OK"
+
+# ------------------------------------------------------------------ main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("folders", nargs="*", help="CREST job folders (default: every subfolder with crest.out)")
+    ap.add_argument("--csv", default="crest_summary.csv")
+    ap.add_argument("--split", type=float, default=None, metavar="KCAL",
+                    help="write conformers within KCAL kcal/mol of the best as separate .xyz files "
+                         "(conformers with changed metal bonding/isomer are skipped)")
+    args = ap.parse_args()
+
+    folders = args.folders or sorted({os.path.dirname(p) for p in glob.glob("*/crest.out")} |
+                                     ({"."} if os.path.isfile("crest.out") else set()))
+    if not folders:
+        sys.exit("No CREST folders found (no */crest.out here). Run this in the folder containing the CREST job folders.")
+    res = [analyze(f) for f in folders]
+
+    cols = [("folder", 36), ("status", 20), ("method", 7), ("chrg", 4), ("uhf", 3), ("alpb", 6),
+            ("n_conf", 6), ("<=1", 4), ("<=3", 4), ("rel. energies (kcal/mol)", 32), ("notes", 0)]
+    print("".join(f"{c:<{w}s} " if w else c for c, w in cols))
+    for r in res:
+        notes = "; ".join(s for s in (
+            r["metal_check"],
+            f"file name says m{r['name_mult']} but --uhf {r['uhf']}" if not r["uhf_ok"] else "",
+            f"{r['warnings']} warning line(s) in crest.out" if r["warnings"] else "") if s)
+        vals = [r["folder"], r["status"], r["method"], str(r["chrg"] or "-"), str(r["uhf"] or "-"),
+                str(r["alpb"] or "-"), str(r["n_conf"]), str(r.get("n_1kcal", "-")), str(r.get("n_3kcal", "-")),
+                r.get("rel_energies", "-"), notes]
+        print("".join(f"{v:<{w}s} " if w else v for v, (c, w) in zip(vals, cols)))
+
+    cnt = {}
+    for r in res: cnt[r["status"]] = cnt.get(r["status"], 0) + 1
+    print("\nSummary: " + ", ".join(f"{k} {v}" for k, v in sorted(cnt.items())))
+    print("Energies are CREST's own level (e.g. GFN2-xTB); re-rank at your production level before choosing.")
+    if any(r["uhf"] is None for r in res if r["status"] != "NO_OUTPUT"):
+        print("Note: '-' under uhf means no --uhf was given (closed shell). Check open-shell runs.")
+
+    keys = ["folder", "status", "terminated", "method", "chrg", "uhf", "alpb", "name_mult", "n_conf", "n_1kcal",
+            "n_3kcal", "E_best", "rel_energies", "metal_CN", "trans_ref", "metal_check", "warnings", "command",
+            "ensemble", "best", "path"]
+    with open(args.csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore"); w.writeheader()
+        for r in res: w.writerow(r)
+    print(f"Wrote {args.csv}")
+
+    if args.split is not None:
+        print()
+        for r in res:
+            if not r["status"].startswith("OK"):
+                continue
+            outdir = os.path.join(r["path"], "conformers")
+            os.makedirs(outdir, exist_ok=True)
+            n = 0
+            for k, ((el, x, comment), rel) in enumerate(zip(r["_confs"], r["_rel"]), 1):
+                if rel is None or rel > args.split or k in r["_bad"]:
+                    continue
+                stem = re.sub(r"_opt$", "", r["folder"])
+                name = f"{stem}_c{k}"          # e.g. terpyNiBr_OA_PhI_o5_m2_c2
+                with open(os.path.join(outdir, name + ".xyz"), "w", newline="\n") as f:
+                    f.write(f"{len(el)}\n{name}  rel {rel:.2f} kcal/mol (CREST level)\n")
+                    for e, (a, b, c) in zip(el, x):
+                        f.write(f"{e:<3s}{a:14.6f}{b:14.6f}{c:14.6f}\n")
+                n += 1
+            print(f"  {r['folder']}: {n} conformer(s) within {args.split} kcal/mol -> {outdir}/")
+
+if __name__ == "__main__":
+    main()
