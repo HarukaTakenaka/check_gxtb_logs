@@ -87,6 +87,10 @@ each `OK` structure relative to the lowest one, in kcal/mol (1 Hartree = 627.509
 you read off the most stable isomer and spin state directly. If the multiplicity in the file name
 differs from the one in the log, the script says so in the notes.
 
+Suffixes after the multiplicity are allowed and stay in the same group, e.g. `_r1` (restart), `_d1`
+(displaced), or `_c2` (CREST conformer 2 from `check_crest.py --split`), so all conformers, isomers,
+and spin states of one species are ranked together.
+
 Files that don't follow the convention get their own one-member group (`dG` = 0.0).
 
 Two additional notes are printed when they apply:
@@ -176,6 +180,3 @@ Then open anything marked `+CHECK_BONDS` (or any surprising result) in GaussView
 - Energies are compared only within a name group. Comparing across species (e.g. a reaction energy)
   is up to you, and only meaningful when all structures used identical xTB settings.
 - The `dG` values are xTB-level free energies, useful for screening, not for reporting.
-
-## Acknowledgement 
-claude
